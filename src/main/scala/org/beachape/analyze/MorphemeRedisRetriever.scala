@@ -3,26 +3,39 @@ import com.redis._
 import com.redis.RedisClient._
 import scala.math.pow
 
-case class MorphemesRedisRetriever(redis: RedisClient, redisKeyOlder: String, redisKeyNewer: String) {
+case class MorphemesRedisRetriever(redis: RedisClient, redisKeyOlder: String, redisKeyNewer: String) extends ChiSquare with RedisHelper{
 
   def byChiSquaredReversed = {
     byChiSquared.reverse
   }
 
+  def storeChiSquared = {
+    val storageKey = f"MorphemesChiSquared:$redisKeyOlder%s-$redisKeyNewer%s"
+    for ((term, chiSquaredScore) <- byChiSquared) {
+      redis.zincrby(storageKey, chiSquaredScore, term)
+      redis.zincrby(storageKey, chiSquaredScore, zSetTotalScoreKey)
+    }
+    storageKey
+  }
+
   def byChiSquared: List[(String, Double)] = {
-    val oldSetTotalScore = redis.zscore(redisKeyOlder, f"$redisKeyOlder%s__akanori_score_counter__") match {
+    val oldSetTotalScore = redis.zscore(redisKeyOlder, zSetTotalScoreKey) match {
       case None => 0
       case Some(x) => x
     }
 
-    val newSetTotalScore = redis.zscore(redisKeyNewer, f"$redisKeyNewer%s__akanori_score_counter__") match {
+    val newSetTotalScore = redis.zscore(redisKeyNewer, zSetTotalScoreKey) match {
       case None => 0
       case Some(x) => x
     }
 
     val morphemeChiSquaredList: List[(String, Double)] = {
       newTermsWithScoresList map { x =>
-        (x._1, calculateChiSquaredForTerm(x._1, x._2, oldSetTotalScore, newSetTotalScore))
+        val oldScoreForTerm = redis.zscore(redisKeyOlder, x._1) match {
+          case Some(y) if y > 0 => y
+          case _ => 1
+        }
+        (x._1, calculateChiSquaredForTerm(oldScoreForTerm, x._2, oldSetTotalScore, newSetTotalScore))
       }
     }
 
@@ -31,33 +44,9 @@ case class MorphemesRedisRetriever(redis: RedisClient, redisKeyOlder: String, re
 
   def newTermsWithScoresList: List[(String, Double)] = {
     redis.zrangebyscoreWithScore(redisKeyNewer, limit = None, sortAs = DESC) match {
-      case Some(x: List[(String, Double)]) => x
+      case Some(x: List[(String, Double)]) => x.filter(_._1 != zSetTotalScoreKey)
       case _ => Nil
     }
-  }
-
-  def calculateChiSquaredForTerm(term: String, termScore: Double, oldSetTotalScore: Double, newSetTotalScore: Double): Double = {
-    val oldScoreForTerm = redis.zscore(redisKeyOlder, term) match {
-      case Some(x) if x > 0 => x
-      case _ => 1
-    }
-
-    // Calculate frequencies
-    val observedTermFrequency = termScore / newSetTotalScore
-    val expectedTermFrequency = oldScoreForTerm / oldSetTotalScore
-    val otherObservedFrequency = (newSetTotalScore - termScore) / newSetTotalScore
-    val otherExpectedFrequency = (oldSetTotalScore - oldScoreForTerm) / oldSetTotalScore
-
-    val normalizer = List(newSetTotalScore, oldSetTotalScore).max
-
-    val termChiSquaredPart = calculateChiSquaredPart(expectedTermFrequency, observedTermFrequency, normalizer)
-    val otherChiSquaredPart = calculateChiSquaredPart(otherExpectedFrequency, otherObservedFrequency, normalizer)
-
-    termChiSquaredPart + otherChiSquaredPart
-  }
-
-  private def calculateChiSquaredPart(expectedFrequency: Double, observedFrequency: Double, normalizer: Double) = {
-    pow(((observedFrequency * normalizer - expectedFrequency * normalizer).abs - 0.5), 2) / (normalizer * expectedFrequency)
   }
 
 }
